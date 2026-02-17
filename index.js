@@ -167,7 +167,7 @@ module.exports = {
             // Active topics
             const allTopics = topicTracker.getAllTopics();
             if (allTopics.length > 0) {
-                const topicStrs = allTopics.slice(0, 10).map(t => {
+                const topicStrs = allTopics.slice(0, 5).map(t => {
                     if (t.mentions >= config.topicTracking.fixationThreshold) {
                         return `${t.topic} (fixated — ${t.mentions} mentions)`;
                     }
@@ -190,7 +190,10 @@ module.exports = {
             // Topic fixation notes
             const fixated = topicTracker.getFixatedTopics();
             if (fixated.length > 0) {
-                lines.push(topicTracker.formatNotes(fixated));
+                const topFixated = fixated
+                    .sort((a, b) => b.mentions - a.mentions)
+                    .slice(0, 3);
+                lines.push(topicTracker.formatNotes(topFixated));
             }
 
             // Archive retrieval — always search, relevance-gate the injection.
@@ -239,7 +242,7 @@ module.exports = {
                                     // "You remember" not "you have access to."
                                     lines.push('');
                                     lines.push('You remember these earlier conversations with this user:');
-                                    const recalled = results.exchanges.slice(0, 5);
+                                    const recalled = results.exchanges.slice(0, 3);
                                     // Sort chronologically (oldest → newest) so corrections
                                     // appear AFTER originals — natural temporal progression.
                                     recalled.sort((a, b) => {
@@ -248,10 +251,10 @@ module.exports = {
                                     });
                                     for (const ex of recalled) {
                                         if (ex.userText) {
-                                            lines.push(`- They told you: "${_truncate(ex.userText, 300)}"`);
+                                            lines.push(`- They told you: "${_truncate(ex.userText, 150)}"`);
                                         }
                                         if (ex.agentText) {
-                                            lines.push(`  You said: "${_truncate(ex.agentText, 300)}"`);
+                                            lines.push(`  You said: "${_truncate(ex.agentText, 150)}"`);
                                         }
                                     }
                                     lines.push('Speak from this memory naturally. Never say "I don\'t have information" about things you remember above.');

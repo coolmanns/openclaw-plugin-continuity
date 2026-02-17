@@ -28,7 +28,7 @@
   "topicTracking": {
     "enabled": true,
     "windowSize": 6,
-    "fixationThreshold": 3,
+    "fixationThreshold": 5,
     "decayFactor": 0.5,
     "customPatterns": [],
     "stopWords": [
@@ -39,7 +39,7 @@
       "does", "doing", "each", "here", "more", "most", "much",
       "only", "other", "over", "same", "such", "very", "your"
     ],
-    "minWordLength": 5,
+    "minWordLength": 6,
     "pruneAge": 86400000
   },
 
@@ -89,6 +89,6 @@
   "continuitySection": {
     "enabled": true,
     "maxAnchorsShown": 5,
-    "maxTopicsShown": 10
+    "maxTopicsShown": 5
   }
 }
