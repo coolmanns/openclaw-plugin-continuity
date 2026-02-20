@@ -18,6 +18,11 @@
  *
  * Hook registration uses api.on() (OpenClaw SDK typed hooks).
  * Continuity context injected via prependContext (before identity kernel).
+ *
+ * Multi-agent: All state (archives, indexes, session tracking) is scoped
+ * per agent via ctx.agentId. Each agent gets its own data subdirectory
+ * under data/agents/{agentId}/. Agents never see each other's memories.
+ * The default/main agent uses the legacy data/ path for backward compat.
  */
 
 const path = require('path');
@@ -81,12 +86,22 @@ module.exports = {
     register(api) {
         const config = loadConfig(api.pluginConfig || {});
 
-        // Ensure plugin-local data directories
-        const dataDir = ensureDir(path.join(__dirname, 'data'));
-        ensureDir(path.join(dataDir, config.archive.archiveDir || 'archive'));
+        // Base data directory for the plugin
+        const baseDataDir = ensureDir(path.join(__dirname, 'data'));
 
         // -------------------------------------------------------------------
-        // Shared module instances (accessible to all hooks + gateway methods)
+        // Per-agent state management
+        //
+        // Each agent gets its own isolated set of:
+        //   - Archiver (daily conversation files)
+        //   - Indexer + Searcher (SQLite-vec embedding DB)
+        //   - TopicTracker, ContinuityAnchors (session-level state)
+        //   - Session counters (exchangeCount, sessionStart)
+        //   - Retrieval cache
+        //
+        // Data directory layout:
+        //   data/                    <- default/main agent (backward compat)
+        //   data/agents/{agentId}/   <- all other agents
         // -------------------------------------------------------------------
 
         const TopicTracker = require('./lib/topic-tracker');
@@ -96,50 +111,88 @@ module.exports = {
         const Indexer = require('./storage/indexer');
         const Searcher = require('./storage/searcher');
 
-        const topicTracker = new TopicTracker(config);
-        const anchors = new ContinuityAnchors(config);
+        // Shared across agents (stateless utility)
         const tokenEstimator = new TokenEstimator(config.tokenEstimation || {});
-        const archiver = new Archiver(config, dataDir);
-
-        let indexer = null;
-        let searcher = null;
-        let storageReady = false;
-        let storageInitPromise = null;
-
-        async function ensureStorage() {
-            if (storageReady) return;
-            // Serialize: if init is already in progress, wait for it
-            if (storageInitPromise) {
-                await storageInitPromise;
-                return;
-            }
-            storageInitPromise = (async () => {
-                try {
-                    indexer = new Indexer(config, dataDir);
-                    await indexer.initialize();
-                    searcher = new Searcher(config, dataDir, indexer.db);
-                    await searcher.initialize();
-                    storageReady = true;
-                } catch (err) {
-                    console.error(`[Continuity] Storage init failed: ${err.message}`);
-                    // Reset so next call can retry
-                    indexer = null;
-                    searcher = null;
-                }
-            })();
-            await storageInitPromise;
-            storageInitPromise = null;
-        }
-
-        // Session state
-        let sessionStart = Date.now();
-        let exchangeCount = 0;
-
-        // Cache the last archive retrieval for tool_result_persist enrichment
-        let _lastRetrievalCache = null;
 
         // Continuity indicators (from config)
         const continuityIndicators = config.continuityIndicators || [];
+
+        /**
+         * Per-agent state container.
+         * Created lazily on first hook invocation for each agent.
+         */
+        class AgentState {
+            constructor(agentId) {
+                this.agentId = agentId;
+
+                // Data directory: legacy path for default/main, scoped for others
+                if (!agentId || agentId === 'main') {
+                    this.dataDir = baseDataDir;
+                } else {
+                    this.dataDir = ensureDir(path.join(baseDataDir, 'agents', agentId));
+                }
+                ensureDir(path.join(this.dataDir, config.archive.archiveDir || 'archive'));
+
+                // Per-agent module instances
+                this.topicTracker = new TopicTracker(config);
+                this.anchors = new ContinuityAnchors(config);
+                this.archiver = new Archiver(config, this.dataDir);
+
+                // Storage (lazy init — embedding model is expensive)
+                this.indexer = null;
+                this.searcher = null;
+                this.storageReady = false;
+                this.storageInitPromise = null;
+
+                // Session state
+                this.sessionStart = Date.now();
+                this.exchangeCount = 0;
+
+                // Retrieval cache (per-agent, per-turn)
+                this.lastRetrievalCache = null;
+            }
+
+            async ensureStorage() {
+                if (this.storageReady) return;
+                if (this.storageInitPromise) {
+                    await this.storageInitPromise;
+                    return;
+                }
+                this.storageInitPromise = (async () => {
+                    try {
+                        this.indexer = new Indexer(config, this.dataDir);
+                        await this.indexer.initialize();
+                        this.searcher = new Searcher(config, this.dataDir, this.indexer.db);
+                        await this.searcher.initialize();
+                        this.storageReady = true;
+                        console.log(`[Continuity] Storage ready for agent "${this.agentId}" at ${this.dataDir}`);
+                    } catch (err) {
+                        console.error(`[Continuity] Storage init failed for agent "${this.agentId}": ${err.message}`);
+                        this.indexer = null;
+                        this.searcher = null;
+                    }
+                })();
+                await this.storageInitPromise;
+                this.storageInitPromise = null;
+            }
+        }
+
+        /** @type {Map<string, AgentState>} */
+        const agentStates = new Map();
+
+        /**
+         * Get or create per-agent state.
+         * @param {string} [agentId] - Agent ID from hook context
+         * @returns {AgentState}
+         */
+        function getAgentState(agentId) {
+            const id = agentId || 'main';
+            if (!agentStates.has(id)) {
+                agentStates.set(id, new AgentState(id));
+                api.logger.info(`Initialized continuity state for agent "${id}"`);
+            }
+            return agentStates.get(id);
+        }
 
         // -------------------------------------------------------------------
         // HOOK: before_agent_start — Inject continuity context via prependContext
@@ -148,7 +201,8 @@ module.exports = {
 
         api.on('before_agent_start', async (event, ctx) => {
           try {
-            exchangeCount++;
+            const state = getAgentState(ctx.agentId);
+            state.exchangeCount++;
 
             // Extract last user message from the event messages array
             const messages = event.messages || [];
@@ -161,11 +215,11 @@ module.exports = {
             const lines = ['[CONTINUITY CONTEXT]'];
 
             // Session info
-            const sessionAge = _formatDuration(Date.now() - sessionStart);
-            lines.push(`Session: ${exchangeCount} exchanges | Started: ${sessionAge}`);
+            const sessionAge = _formatDuration(Date.now() - state.sessionStart);
+            lines.push(`Session: ${state.exchangeCount} exchanges | Started: ${sessionAge}`);
 
             // Active topics
-            const allTopics = topicTracker.getAllTopics();
+            const allTopics = state.topicTracker.getAllTopics();
             if (allTopics.length > 0) {
                 const topicStrs = allTopics.slice(0, 5).map(t => {
                     if (t.mentions >= config.topicTracking.fixationThreshold) {
@@ -178,7 +232,7 @@ module.exports = {
             }
 
             // Continuity anchors
-            const activeAnchors = anchors.getAnchors();
+            const activeAnchors = state.anchors.getAnchors();
             if (activeAnchors.length > 0) {
                 const anchorStrs = activeAnchors.slice(0, 5).map(a => {
                     const age = _formatAge(a.timestamp);
@@ -188,12 +242,12 @@ module.exports = {
             }
 
             // Topic fixation notes
-            const fixated = topicTracker.getFixatedTopics();
+            const fixated = state.topicTracker.getFixatedTopics();
             if (fixated.length > 0) {
                 const topFixated = fixated
                     .sort((a, b) => b.mentions - a.mentions)
                     .slice(0, 3);
-                lines.push(topicTracker.formatNotes(topFixated));
+                lines.push(state.topicTracker.formatNotes(topFixated));
             }
 
             // Archive retrieval — always search, relevance-gate the injection.
@@ -212,29 +266,29 @@ module.exports = {
                 lowerUser.includes(ind)
             );
 
-            _lastRetrievalCache = null;
+            state.lastRetrievalCache = null;
             const RELEVANCE_THRESHOLD = 1.0; // compositeScore below this = semantically relevant
-            console.error(`[Continuity] Search: intent=${hasContinuityIntent}, len=${cleanUserText.length}, query="${cleanUserText.substring(0, 80)}"`);
+            console.error(`[Continuity:${state.agentId}] Search: intent=${hasContinuityIntent}, len=${cleanUserText.length}, query="${cleanUserText.substring(0, 80)}"`);
 
             if (cleanUserText.length >= 10) {
                 try {
-                    await ensureStorage();
-                    if (searcher) {
-                        const results = await searcher.search(cleanUserText, 30);
-                        console.error(`[Continuity] Search returned ${results?.exchanges?.length || 0} raw results`);
+                    await state.ensureStorage();
+                    if (state.searcher) {
+                        const results = await state.searcher.search(cleanUserText, 30);
+                        console.error(`[Continuity:${state.agentId}] Search returned ${results?.exchanges?.length || 0} raw results`);
                         if (results?.exchanges?.length > 0) {
                             results.exchanges = _filterUsefulExchanges(results.exchanges);
-                            console.error(`[Continuity] After filter: ${results.exchanges.length} useful results`);
+                            console.error(`[Continuity:${state.agentId}] After filter: ${results.exchanges.length} useful results`);
                             if (results.exchanges.length > 0) {
                                 // Always cache for tool_result_persist enrichment
-                                _lastRetrievalCache = results;
+                                state.lastRetrievalCache = results;
 
                                 // Inject into prependContext if:
                                 // 1. Explicit continuity intent (user asking about past), OR
                                 // 2. Top result is semantically relevant (distance below threshold)
                                 const topScore = results.exchanges[0].compositeScore ?? results.exchanges[0].distance;
                                 const shouldInject = hasContinuityIntent || topScore < RELEVANCE_THRESHOLD;
-                                console.error(`[Continuity] topScore=${topScore.toFixed(3)}, threshold=${RELEVANCE_THRESHOLD}, inject=${shouldInject}`);
+                                console.error(`[Continuity:${state.agentId}] topScore=${topScore.toFixed(3)}, threshold=${RELEVANCE_THRESHOLD}, inject=${shouldInject}`);
 
                                 if (shouldInject) {
                                     // Proprioceptive framing (from Clint's architecture):
@@ -262,10 +316,10 @@ module.exports = {
                             }
                         }
                     } else {
-                        console.error('[Continuity] Retrieval skipped: searcher not available after ensureStorage()');
+                        console.error(`[Continuity:${state.agentId}] Retrieval skipped: searcher not available after ensureStorage()`);
                     }
                 } catch (err) {
-                    console.error(`[Continuity] Retrieval failed: ${err.message}`);
+                    console.error(`[Continuity:${state.agentId}] Retrieval failed: ${err.message}`);
                 }
             }
 
@@ -290,16 +344,17 @@ module.exports = {
             const query = event.params?.query || '';
             if (!query || query.length < 3) return;
 
+            const state = getAgentState(ctx.agentId);
             try {
-                await ensureStorage();
-                if (searcher) {
-                    const results = await searcher.search(query, 30);
+                await state.ensureStorage();
+                if (state.searcher) {
+                    const results = await state.searcher.search(query, 30);
                     if (results?.exchanges?.length > 0) {
-                        _lastRetrievalCache = results;
+                        state.lastRetrievalCache = results;
                     }
                 }
             } catch (err) {
-                console.error(`[Continuity] Archive search for memory_search failed: ${err.message}`);
+                console.error(`[Continuity:${state.agentId}] Archive search for memory_search failed: ${err.message}`);
             }
         });
 
@@ -310,7 +365,8 @@ module.exports = {
         api.on('after_tool_call', (event, ctx) => {
             const text = _extractToolText(event.result);
             if (text && text.length > 20) {
-                topicTracker.track(text);
+                const state = getAgentState(ctx.agentId);
+                state.topicTracker.track(text);
             }
         });
 
@@ -341,11 +397,11 @@ module.exports = {
             // We need to search synchronously or use cached results.
             // tool_result_persist is sync, so we can't await.
             // Instead, use a cached retrieval from before_agent_start if available.
-            if (!_lastRetrievalCache) return;
+            const state = getAgentState(ctx.agentId);
+            if (!state.lastRetrievalCache) return;
 
-            // Filter out noise: exchanges where the agent said "I don't have" or
             // Filter noise using shared filter function
-            const usefulExchanges = _filterUsefulExchanges(_lastRetrievalCache.exchanges);
+            const usefulExchanges = _filterUsefulExchanges(state.lastRetrievalCache.exchanges);
 
             // Inject archive results as additional entries in the results array
             const archiveResults = usefulExchanges.slice(0, 5).map(ex => ({
@@ -401,10 +457,11 @@ module.exports = {
         });
 
         // -------------------------------------------------------------------
-        // HOOK: agent_end — Archive, update anchors/topics, write MEMORY.md section
+        // HOOK: agent_end — Archive, update anchors/topics
         // -------------------------------------------------------------------
 
         api.on('agent_end', async (event, ctx) => {
+            const state = getAgentState(ctx.agentId);
             const messages = event.messages || [];
             const lastAssistant = [...messages].reverse().find(m => m?.role === 'assistant');
             const lastUser = [...messages].reverse().find(m => m?.role === 'user');
@@ -418,8 +475,8 @@ module.exports = {
             const userMessage = _stripContextBlocks(rawUserMessage);
 
             // 1. Update topic tracker
-            if (userMessage) topicTracker.track(userMessage);
-            topicTracker.advanceExchange();
+            if (userMessage) state.topicTracker.track(userMessage);
+            state.topicTracker.advanceExchange();
 
             // 2. Refresh continuity anchors
             //    Filter out plugin-injected context blocks to prevent feedback loop
@@ -428,7 +485,7 @@ module.exports = {
                 return !text.startsWith('[CONTINUITY CONTEXT]') &&
                        !text.startsWith('[STABILITY CONTEXT]');
             });
-            anchors.detect(cleanMessages);
+            state.anchors.detect(cleanMessages);
 
             // 3. Archive the exchange (strip context blocks from user message)
             const toArchive = [];
@@ -449,23 +506,23 @@ module.exports = {
             }
 
             try {
-                archiver.archive(toArchive);
+                state.archiver.archive(toArchive);
             } catch (err) {
-                console.error(`[Continuity] Archive failed: ${err.message}`);
+                console.error(`[Continuity:${state.agentId}] Archive failed: ${err.message}`);
             }
 
             // 3b. Incremental index (best-effort, non-blocking)
             try {
-                await ensureStorage();
-                if (indexer) {
+                await state.ensureStorage();
+                if (state.indexer) {
                     const today = new Date().toISOString().substring(0, 10);
-                    const conversation = archiver.getConversation(today);
+                    const conversation = state.archiver.getConversation(today);
                     if (conversation && conversation.messages) {
-                        await indexer.indexDay(today, conversation.messages);
+                        await state.indexer.indexDay(today, conversation.messages);
                     }
                 }
             } catch (err) {
-                console.error(`[Continuity] Incremental index failed: ${err.message}`);
+                console.error(`[Continuity:${state.agentId}] Incremental index failed: ${err.message}`);
             }
 
             // Session state (topics, anchors) is delivered via prependContext each turn.
@@ -477,9 +534,10 @@ module.exports = {
         // -------------------------------------------------------------------
 
         api.on('before_compaction', async (event, ctx) => {
-            const activeAnchors = anchors.getAnchors();
-            const allTopics = topicTracker.getAllTopics();
-            const fixatedTopics = topicTracker.getFixatedTopics();
+            const state = getAgentState(ctx.agentId);
+            const activeAnchors = state.anchors.getAnchors();
+            const allTopics = state.topicTracker.getAllTopics();
+            const fixatedTopics = state.topicTracker.getFixatedTopics();
 
             if (activeAnchors.length > 0 || fixatedTopics.length > 0) {
                 const parts = ['[Continuity Pre-Compaction Summary]'];
@@ -506,71 +564,90 @@ module.exports = {
         });
 
         // -------------------------------------------------------------------
-        // HOOK: session_start — Reset session state
+        // HOOK: session_start — Reset session state (per-agent)
         // -------------------------------------------------------------------
 
         api.on('session_start', (event, ctx) => {
-            sessionStart = Date.now();
-            exchangeCount = 0;
-            topicTracker.reset();
-            anchors.reset();
-            api.logger.info(`Session started: ${event.sessionId}`);
+            const state = getAgentState(ctx.agentId);
+            state.sessionStart = Date.now();
+            state.exchangeCount = 0;
+            state.topicTracker.reset();
+            state.anchors.reset();
+            api.logger.info(`Session started for agent "${state.agentId}": ${event.sessionId}`);
         });
 
         // -------------------------------------------------------------------
-        // HOOK: session_end — Final archive + index
+        // HOOK: session_end — Final archive + index (per-agent)
         // -------------------------------------------------------------------
 
         api.on('session_end', async (event, ctx) => {
-            api.logger.info(`Session ended: ${event.sessionId} (${event.messageCount} messages, ${exchangeCount} exchanges)`);
+            const state = getAgentState(ctx.agentId);
+            api.logger.info(`Session ended for agent "${state.agentId}": ${event.sessionId} (${event.messageCount} messages, ${state.exchangeCount} exchanges)`);
 
             // Trigger indexing of today's archive
             try {
-                await ensureStorage();
-                if (indexer) {
+                await state.ensureStorage();
+                if (state.indexer) {
                     const today = new Date().toISOString().substring(0, 10);
-                    const conversation = archiver.getConversation(today);
+                    const conversation = state.archiver.getConversation(today);
                     if (conversation && conversation.messages) {
-                        await indexer.indexDay(today, conversation.messages);
+                        await state.indexer.indexDay(today, conversation.messages);
                     }
                 }
             } catch (err) {
-                api.logger.warn(`Session-end indexing failed: ${err.message}`);
+                api.logger.warn(`Session-end indexing failed for agent "${state.agentId}": ${err.message}`);
             }
         });
 
         // -------------------------------------------------------------------
         // Service: background maintenance
+        //
+        // Runs per-agent. Each known agent gets its own maintenance cycle.
+        // New agents discovered after service start get maintenance on their
+        // first ensureStorage() call.
         // -------------------------------------------------------------------
 
         const MaintenanceService = require('./services/maintenance');
-        let maintenance = null;
+        const maintenanceInstances = new Map();
+
         api.registerService({
             id: 'continuity-maintenance',
             start: async (serviceCtx) => {
-                await ensureStorage();
-                maintenance = new MaintenanceService(config, archiver, indexer);
-                await maintenance.execute();
-                // Re-index every 5 minutes
-                maintenance.startInterval(5 * 60 * 1000);
+                // Initialize maintenance for any agents already known
+                for (const [agentId, state] of agentStates) {
+                    await state.ensureStorage();
+                    if (state.indexer) {
+                        const m = new MaintenanceService(config, state.archiver, state.indexer);
+                        await m.execute();
+                        m.startInterval(5 * 60 * 1000);
+                        maintenanceInstances.set(agentId, m);
+                    }
+                }
             },
             stop: async () => {
-                if (maintenance) maintenance.stopInterval();
+                for (const [, m] of maintenanceInstances) {
+                    m.stopInterval();
+                }
+                maintenanceInstances.clear();
             }
         });
 
         // -------------------------------------------------------------------
         // Gateway methods — dashboards + debugging
+        //
+        // Accept optional agentId param; default to 'main'.
         // -------------------------------------------------------------------
 
-        api.registerGatewayMethod('continuity.getState', async ({ respond }) => {
+        api.registerGatewayMethod('continuity.getState', async ({ params, respond }) => {
+            const state = getAgentState(params?.agentId);
             respond(true, {
-                archive: archiver.getStats(),
-                topics: topicTracker.getAllTopics(),
-                anchors: anchors.getAnchors(),
-                exchangeCount,
-                sessionAge: Date.now() - sessionStart,
-                indexReady: storageReady
+                agentId: state.agentId,
+                archive: state.archiver.getStats(),
+                topics: state.topicTracker.getAllTopics(),
+                anchors: state.anchors.getAnchors(),
+                exchangeCount: state.exchangeCount,
+                sessionAge: Date.now() - state.sessionStart,
+                indexReady: state.storageReady
             });
         });
 
@@ -579,13 +656,14 @@ module.exports = {
         });
 
         api.registerGatewayMethod('continuity.search', async ({ params, respond }) => {
+            const state = getAgentState(params?.agentId);
             try {
-                await ensureStorage();
-                if (!searcher) {
-                    respond(false, null, { message: 'Searcher not initialized' });
+                await state.ensureStorage();
+                if (!state.searcher) {
+                    respond(false, null, { message: `Searcher not initialized for agent "${state.agentId}"` });
                     return;
                 }
-                const results = await searcher.search(
+                const results = await state.searcher.search(
                     params?.text || params?.query || '',
                     params?.limit || 5
                 );
@@ -595,18 +673,34 @@ module.exports = {
             }
         });
 
-        api.registerGatewayMethod('continuity.getArchiveStats', async ({ respond }) => {
-            respond(true, archiver.getStats());
+        api.registerGatewayMethod('continuity.getArchiveStats', async ({ params, respond }) => {
+            const state = getAgentState(params?.agentId);
+            respond(true, state.archiver.getStats());
         });
 
-        api.registerGatewayMethod('continuity.getTopics', async ({ respond }) => {
+        api.registerGatewayMethod('continuity.getTopics', async ({ params, respond }) => {
+            const state = getAgentState(params?.agentId);
             respond(true, {
-                topics: topicTracker.getAllTopics(),
-                fixated: topicTracker.getFixatedTopics()
+                agentId: state.agentId,
+                topics: state.topicTracker.getAllTopics(),
+                fixated: state.topicTracker.getFixatedTopics()
             });
         });
 
-        api.logger.info('Continuity plugin registered — context budgeting, topic tracking, archive + semantic search active');
+        api.registerGatewayMethod('continuity.listAgents', async ({ respond }) => {
+            const agents = [];
+            for (const [id, state] of agentStates) {
+                agents.push({
+                    agentId: id,
+                    exchangeCount: state.exchangeCount,
+                    storageReady: state.storageReady,
+                    dataDir: state.dataDir
+                });
+            }
+            respond(true, agents);
+        });
+
+        api.logger.info('Continuity plugin registered (multi-agent) — per-agent context budgeting, topic tracking, archive + semantic search');
     }
 };
 
