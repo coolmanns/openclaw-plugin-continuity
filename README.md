@@ -6,7 +6,7 @@ Gives your agent the ability to remember conversations across sessions. When a u
 
 ## What it does
 
-- **Cross-session memory**: Archives every conversation, indexes it with semantic embeddings, and retrieves relevant exchanges when the user references past discussions.
+- **Cross-session memory**: Archives every conversation, indexes it with semantic embeddings (768d GPU-accelerated or 384d CPU fallback), and retrieves relevant exchanges when the user references past discussions.
 - **Context budgeting**: Manages token allocation across priority tiers so important context (recent turns, identity anchors) survives compaction.
 - **Continuity anchors**: Detects and preserves identity-defining moments, contradictions, and unresolved tensions across the conversation.
 - **Topic tracking**: Monitors which subjects the user keeps returning to, flags fixated topics, and tracks freshness decay.
@@ -86,9 +86,35 @@ npm install
 This installs:
 - `better-sqlite3` — synchronous SQLite driver
 - `sqlite-vec` — vector search extension for SQLite
-- `@chroma-core/default-embed` — embedding model (Xenova/all-MiniLM-L6-v2, 384 dimensions)
+- `@chroma-core/default-embed` — ONNX embedding model fallback (Xenova/all-MiniLM-L6-v2, 384d)
 
 All dependencies are self-contained in the plugin's `node_modules`. No global installs required.
+
+### GPU-Accelerated Embeddings (Optional, Recommended)
+
+For significantly faster search and indexing, run a llama.cpp embedding server:
+
+```bash
+# Docker (adjust image for your GPU — NVIDIA, AMD ROCm, or CPU)
+docker run -d --name llama-embed -p 8082:8080 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/ggml-org/llama.cpp:server \
+  llama-server -m /models/nomic-embed-text-v1.5-f16.gguf \
+  --embedding --pooling mean -c 2048 -ngl 999 \
+  --host 0.0.0.0 --port 8080
+```
+
+Download the model:
+```bash
+huggingface-cli download nomic-ai/nomic-embed-text-v1.5-GGUF nomic-embed-text-v1.5.f16.gguf
+```
+
+The plugin auto-detects the llama.cpp server on `http://localhost:8082` and uses it for 768d embeddings. If unavailable, it falls back to ONNX (384d). Configure the URL via `LLAMA_EMBED_URL` environment variable.
+
+| Backend | Dimensions | Indexing Speed | Search Latency |
+|---------|-----------|---------------|----------------|
+| llama.cpp (GPU) | 768 | ~1,600 exchanges in 12s | **6.5ms avg** |
+| ONNX (CPU) | 384 | ~1,600 exchanges in 6.5min | ~240ms avg |
 
 ### Configure OpenClaw
 
@@ -133,8 +159,13 @@ And the indexer initialization:
 ```
 [Indexer] sqlite-vec loaded: v0.1.7-alpha.2
 [Indexer] Database tables ready
-[Indexer] Embedding model ready (384 dimensions)
+[Indexer] llama.cpp embedding server ready (768 dimensions, http://localhost:8082)
 [Indexer] Initialized — SQLite-vec ready
+```
+
+Or, if using the ONNX fallback:
+```
+[Indexer] Embedding model ready (384 dimensions) — fallback
 ```
 
 ## How it works
@@ -199,7 +230,7 @@ These are configurable via `continuityIndicators` in the config.
 | Component | Location | Format |
 |-----------|----------|--------|
 | Daily archives | `data/archive/YYYY-MM-DD.json` | JSON with timestamped messages |
-| Semantic index | `data/continuity.db` | SQLite + sqlite-vec (384-dim embeddings) |
+| Semantic index | `data/continuity.db` | SQLite + sqlite-vec (768d with llama.cpp, 384d with ONNX) |
 | Index log | `data/index-log.json` | Tracks which dates have been indexed |
 | Agent instructions | `~/.openclaw/workspace/AGENTS.md` | `### Recalled Memories` section (user-managed) |
 
@@ -256,7 +287,7 @@ All configuration is optional. The plugin ships with sensible defaults in `confi
 
   "embedding": {
     "model": "Xenova/all-MiniLM-L6-v2",
-    "dimensions": 384,
+    "dimensions": 768,
     "dbFile": "continuity.db"
   },
 
@@ -307,8 +338,8 @@ index.js                 Main plugin — hook registration, orchestration
 │   └── compactor.js          Threshold-triggered context compression
 ├── storage/
 │   ├── archiver.js           Daily JSON conversation storage + dedup
-│   ├── indexer.js            SQLite-vec embedding + exchange pairing
-│   └── searcher.js           Semantic retrieval + temporal re-ranking
+│   ├── indexer.js            SQLite-vec embedding + exchange pairing (llama.cpp → ONNX fallback)
+│   └── searcher.js           Semantic retrieval + temporal re-ranking (llama.cpp → ONNX fallback)
 └── services/
     └── maintenance.js        Background batch indexing + pruning
 ```
@@ -357,6 +388,7 @@ This plugin is designed to **complement**, not replace, OpenClaw's built-in memo
 - **`systemPrompt` return is not applied**: The `before_agent_start` hook type declares `systemPrompt` as a return field, but OpenClaw's runtime does not read it. Use `prependContext` for context injection and AGENTS.md for identity-level instructions.
 - **`tool_result_persist` is synchronous**: This hook cannot be async. Any data needed must be pre-cached (via `before_tool_call` which IS async).
 - **Plugin `console.log` goes to gateway log**: Use `console.error` if you need output in the error log file. `api.logger.warn` output is not visible in either log file.
+- **`plugins.allow` silently blocks plugins**: If you set `plugins.allow` in your OpenClaw config, every plugin must be listed — including this one. A plugin with `"enabled": true` but missing from the allowlist will silently not load. Check the `before_agent_start` handler count in logs to verify.
 
 ## Troubleshooting
 
