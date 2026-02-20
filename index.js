@@ -165,9 +165,9 @@ module.exports = {
                         this.searcher = new Searcher(config, this.dataDir, this.indexer.db);
                         await this.searcher.initialize();
                         this.storageReady = true;
-                        console.log(`[Continuity] Storage ready for agent "${this.agentId}" at ${this.dataDir}`);
+                        api.logger.info(`[Continuity] Storage ready for agent "${this.agentId}" at ${this.dataDir}`);
                     } catch (err) {
-                        console.error(`[Continuity] Storage init failed for agent "${this.agentId}": ${err.message}`);
+                        api.logger.error(`[Continuity] Storage init failed for agent "${this.agentId}": ${err.message}`);
                         this.indexer = null;
                         this.searcher = null;
                     }
