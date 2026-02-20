@@ -36,11 +36,80 @@ class Searcher {
     async initialize() {
         if (this._initialized) return;
 
+        // 1) Try llama.cpp embedding server (GPU-accelerated)
+        const llamaUrl = process.env.LLAMA_EMBED_URL || 'http://localhost:8082';
+        try {
+            const http = require('http');
+            const testPayload = JSON.stringify({ input: 'search_query: test', model: 'nomic-embed-text-v1.5' });
+            const result = await new Promise((resolve, reject) => {
+                const url = new URL(`${llamaUrl}/v1/embeddings`);
+                const req = http.request({
+                    hostname: url.hostname,
+                    port: url.port,
+                    path: url.pathname,
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(testPayload) },
+                    timeout: 5000,
+                }, (res) => {
+                    let body = '';
+                    res.on('data', chunk => body += chunk);
+                    res.on('end', () => {
+                        try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+                    });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(testPayload);
+                req.end();
+            });
+
+            if (result?.data?.[0]?.embedding?.length > 0) {
+                this._embeddingFn = {
+                    generate: async (texts) => {
+                        // Use search_query prefix for retrieval queries
+                        const prefixed = texts.map(t => t.startsWith('search_') ? t : `search_query: ${t}`);
+                        const payload = JSON.stringify({ input: prefixed, model: 'nomic-embed-text-v1.5' });
+                        return new Promise((resolve, reject) => {
+                            const url = new URL(`${llamaUrl}/v1/embeddings`);
+                            const req = http.request({
+                                hostname: url.hostname,
+                                port: url.port,
+                                path: url.pathname,
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+                                timeout: 30000,
+                            }, (res) => {
+                                let body = '';
+                                res.on('data', chunk => body += chunk);
+                                res.on('end', () => {
+                                    try {
+                                        const data = JSON.parse(body);
+                                        resolve((data.data || []).map(d => d.embedding));
+                                    } catch (e) { reject(e); }
+                                });
+                            });
+                            req.on('error', reject);
+                            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                            req.write(payload);
+                            req.end();
+                        });
+                    }
+                };
+                this._initialized = true;
+                console.log(`[Searcher] llama.cpp embedding server ready (${llamaUrl})`);
+                return;
+            }
+        } catch (err) {
+            console.warn(`[Searcher] llama.cpp not available: ${err.message}`);
+        }
+
+        // 2) Fallback: ONNX
         try {
             const { DefaultEmbeddingFunction } = require('@chroma-core/default-embed');
             this._embeddingFn = new DefaultEmbeddingFunction();
             await this._embeddingFn.generate(['warmup']);
             this._initialized = true;
+            console.log('[Searcher] ONNX embedding ready — fallback');
         } catch {
             try {
                 const { pipeline } = require('@huggingface/transformers');

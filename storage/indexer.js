@@ -24,7 +24,7 @@ class Indexer {
     constructor(config = {}, dataDir) {
         const ec = config.embedding || {};
         this.dbPath = path.join(dataDir, ec.dbFile || 'continuity.db');
-        this.dimensions = ec.dimensions || 384;
+        this.dimensions = ec.dimensions || 768;
         this.model = ec.model || 'Xenova/all-MiniLM-L6-v2';
         this.indexLogPath = path.join(dataDir, 'index-log.json');
 
@@ -58,11 +58,12 @@ class Indexer {
             // WAL mode for concurrent read performance
             this.db.pragma('journal_mode = WAL');
 
-            // Create tables
-            this._createTables();
-
-            // Initialize embeddings
+            // Initialize embeddings FIRST — this may update this.dimensions
+            // (e.g. llama.cpp returns 768d instead of default 384d)
             await this._initEmbeddings();
+
+            // Create tables AFTER dimensions are known
+            this._createTables();
 
             this._initialized = true;
             console.log('[Indexer] Initialized — SQLite-vec ready');
@@ -234,8 +235,34 @@ class Indexer {
             CREATE INDEX IF NOT EXISTS idx_exchanges_date ON exchanges(date);
         `);
 
-        // Vector table
+        // Vector table — check if dimensions match, recreate if changed
         try {
+            // Check existing vector table dimensions
+            let needsRecreate = false;
+            try {
+                const info = this.db.prepare("SELECT * FROM vec_exchanges_info LIMIT 1").get();
+                // vec0 info table has column count info; if dimensions changed we need to recreate
+                const testRow = this.db.prepare("SELECT embedding FROM vec_exchanges LIMIT 1").get();
+                if (testRow && testRow.embedding) {
+                    const existingDims = new Float32Array(testRow.embedding.buffer || testRow.embedding).length;
+                    if (existingDims !== this.dimensions) {
+                        console.log(`[Indexer] Dimension change detected: ${existingDims} → ${this.dimensions}, recreating vector table`);
+                        needsRecreate = true;
+                    }
+                }
+            } catch (e) {
+                // Table doesn't exist yet — will create below
+            }
+
+            if (needsRecreate) {
+                this.db.exec('DROP TABLE IF EXISTS vec_exchanges');
+                // Clear index log so all days get re-indexed with new dimensions
+                if (fs.existsSync(this.indexLogPath)) {
+                    fs.writeFileSync(this.indexLogPath, JSON.stringify({ dates: [], lastIndexed: null }, null, 2));
+                    console.log('[Indexer] Cleared index log — full re-index needed');
+                }
+            }
+
             this.db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_exchanges USING vec0(
                     id TEXT PRIMARY KEY,
@@ -253,10 +280,80 @@ class Indexer {
 
     /**
      * Initialize embedding model.
-     * Primary: @chroma-core/default-embed (same as knowledgeSystem.js)
-     * Fallback: @huggingface/transformers pipeline
+     * Priority: 1) llama.cpp server (GPU-accelerated, 768d)
+     *           2) @chroma-core/default-embed (ONNX CPU, 384d)
+     *           3) @huggingface/transformers pipeline (ONNX CPU, 384d)
      */
     async _initEmbeddings() {
+        // 1) Try llama.cpp embedding server (nomic-embed-text-v1.5 on GPU)
+        const llamaUrl = process.env.LLAMA_EMBED_URL || 'http://localhost:8082';
+        try {
+            const http = require('http');
+            const testPayload = JSON.stringify({ input: 'search_document: test', model: 'nomic-embed-text-v1.5' });
+            const result = await new Promise((resolve, reject) => {
+                const url = new URL(`${llamaUrl}/v1/embeddings`);
+                const req = http.request({
+                    hostname: url.hostname,
+                    port: url.port,
+                    path: url.pathname,
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(testPayload) },
+                    timeout: 5000,
+                }, (res) => {
+                    let body = '';
+                    res.on('data', chunk => body += chunk);
+                    res.on('end', () => {
+                        try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+                    });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(testPayload);
+                req.end();
+            });
+
+            if (result?.data?.[0]?.embedding?.length > 0) {
+                const dims = result.data[0].embedding.length;
+                this.dimensions = dims;
+                this._embeddingFn = {
+                    generate: async (texts) => {
+                        // Prepend task prefix for nomic-embed-text
+                        const prefixed = texts.map(t => t.startsWith('search_') ? t : `search_document: ${t}`);
+                        const payload = JSON.stringify({ input: prefixed, model: 'nomic-embed-text-v1.5' });
+                        return new Promise((resolve, reject) => {
+                            const url = new URL(`${llamaUrl}/v1/embeddings`);
+                            const req = http.request({
+                                hostname: url.hostname,
+                                port: url.port,
+                                path: url.pathname,
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+                                timeout: 30000,
+                            }, (res) => {
+                                let body = '';
+                                res.on('data', chunk => body += chunk);
+                                res.on('end', () => {
+                                    try {
+                                        const data = JSON.parse(body);
+                                        resolve((data.data || []).map(d => d.embedding));
+                                    } catch (e) { reject(e); }
+                                });
+                            });
+                            req.on('error', reject);
+                            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                            req.write(payload);
+                            req.end();
+                        });
+                    }
+                };
+                console.log(`[Indexer] llama.cpp embedding server ready (${dims} dimensions, ${llamaUrl})`);
+                return;
+            }
+        } catch (err) {
+            console.warn(`[Indexer] llama.cpp server not available (${llamaUrl}): ${err.message}`);
+        }
+
+        // 2) Fallback: @chroma-core/default-embed (ONNX)
         try {
             const { DefaultEmbeddingFunction } = require('@chroma-core/default-embed');
             this._embeddingFn = new DefaultEmbeddingFunction();
@@ -264,7 +361,7 @@ class Indexer {
             // Warm up
             const test = await this._embeddingFn.generate(['test']);
             if (test && test[0] && test[0].length === this.dimensions) {
-                console.log(`[Indexer] Embedding model ready (${this.dimensions} dimensions)`);
+                console.log(`[Indexer] ONNX embedding model ready (${this.dimensions} dimensions) — fallback`);
                 return;
             }
             console.warn(`[Indexer] Dimension mismatch: expected ${this.dimensions}, got ${test?.[0]?.length}`);
@@ -272,7 +369,7 @@ class Indexer {
             console.warn('[Indexer] @chroma-core/default-embed failed:', err.message);
         }
 
-        // Fallback: direct transformers.js
+        // 3) Fallback: direct transformers.js
         try {
             const { pipeline } = require('@huggingface/transformers');
             this._embeddingPipeline = await pipeline('feature-extraction', this.model);
@@ -286,10 +383,10 @@ class Indexer {
                     return results;
                 }
             };
-            console.log('[Indexer] Fallback embedding model ready');
+            console.log('[Indexer] Fallback transformers.js embedding model ready');
         } catch (fallbackErr) {
             console.error('[Indexer] All embedding models failed:', fallbackErr.message);
-            throw new Error('No embedding model available. Install @chroma-core/default-embed or @huggingface/transformers.');
+            throw new Error('No embedding model available. Install llama.cpp server, @chroma-core/default-embed, or @huggingface/transformers.');
         }
     }
 
